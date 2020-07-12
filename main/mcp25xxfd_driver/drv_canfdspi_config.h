@@ -1,0 +1,12 @@
+#ifndef DRV_CANFDSPI_CONFIG_H__
+#define DRV_CANFDSPI_CONFIG_H__
+
+#define SPI_DEFAULT_BUFFER_LENGTH 96U
+
+#define PIN_NUM_MISO 12
+#define PIN_NUM_MOSI 13
+#define PIN_NUM_CLK  14
+#define PIN_NUM_CS   15
+#define CANFD_SPI    SPI2_HOST
+
+#endif /* DRV_CANFDSPI_CONFIG_H__ */

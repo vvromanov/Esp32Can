@@ -1,129 +1,71 @@
-/* UART Events Example
-
- This example code is in the Public Domain (or CC0 licensed, at your option.)
-
- Unless required by applicable law or agreed to in writing, this
- software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
- CONDITIONS OF ANY KIND, either express or implied.
- */
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/uart.h"
+#include "driver/spi_master.h"
 #include "esp_log.h"
+#include "protocol_data.h"
+#include "drv_canfdspi_api.h"
+#include "drv_canfdspi_spi.h"
+#include "drv_canfdspi_config.h"
 
-static const char *TAG = "uart_events";
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
 
-/**
- * This example shows how to use the UART driver to handle special UART events.
- *
- * It also reads data from UART0 directly, and echoes it to console.
- *
- * - Port: UART0
- * - Receive (Rx) buffer: on
- * - Transmit (Tx) buffer: off
- * - Flow control: off
- * - Event queue: on
- * - Pin assignment: TxD (default), RxD (default)
- */
+static const char *TAG = "SYS";
 
 #define EX_UART_NUM UART_NUM_0
 #define PATTERN_CHR_NUM    (2)         /*!< Set the number of consecutive and identical characters received by receiver which defines a UART pattern*/
 
 #define BUF_SIZE (1024)
 #define RD_BUF_SIZE (BUF_SIZE)
-#define CMD_COMPRESSED_SIZE 10240
 static QueueHandle_t uart0_queue;
+
+#define BLOCK_SIZE 120
 
 static void uart_event_task (void *pvParameters) {
     uart_event_t event;
-    size_t buffered_size, data_size = 0;
-    bool invalid_buffer = false;
-    static uint8_t dtmp [CMD_COMPRESSED_SIZE];
+    uint8_t data[BLOCK_SIZE];
     for (;;) {
         //Waiting for UART event.
         if (xQueueReceive(uart0_queue, (void* )&event, (portTickType)portMAX_DELAY)) {
-//            ESP_LOGI(TAG, "uart[%d] event:", EX_UART_NUM);
             switch (event.type) {
-                //Event of UART receving data
-                /*We'd better handler data event fast, there would be much more data events than
-                 other types of events. If we take too much time on data event, the queue might
-                 be full.*/
                 case UART_DATA:
-//                    ESP_LOGI(TAG, "[UART DATA]: %d", event.size);
-                    if ((event.size + data_size) > CMD_COMPRESSED_SIZE) {
-                        data_size += event.size;
-                        invalid_buffer = true;
-                    } else {
-                        size_t read_size = uart_read_bytes (EX_UART_NUM, dtmp + data_size, event.size, portMAX_DELAY);
-                        data_size += read_size;
+                {
+                    size_t remaining_data = event.size;
+                    while (remaining_data) {
+                        size_t read_size = uart_read_bytes (EX_UART_NUM, data, MIN(remaining_data, sizeof(data)), portMAX_DELAY);
+                        process_data(data,read_size);
+                        remaining_data-=read_size;
                     }
+                }
                     break;
                     //Event of HW FIFO overflow detected
                 case UART_FIFO_OVF:
                     ESP_LOGI(TAG, "hw fifo overflow");
-                    // If fifo overflow happened, you should consider adding flow control for your application.
-                    // The ISR has already reset the rx FIFO,
-                    // As an example, we directly flush the rx buffer here in order to read more data.
                     uart_flush_input (EX_UART_NUM);
-                    invalid_buffer = true;
                     xQueueReset(uart0_queue);
                     break;
                     //Event of UART ring buffer full
                 case UART_BUFFER_FULL:
                     ESP_LOGI(TAG, "ring buffer full");
-                    // If buffer full happened, you should consider encreasing your buffer size
-                    // As an example, we directly flush the rx buffer here in order to read more data.
                     uart_flush_input (EX_UART_NUM);
-                    invalid_buffer = true;
                     xQueueReset(uart0_queue);
                     break;
                     //Event of UART RX break detected
                 case UART_BREAK:
-                    invalid_buffer = true;
                     ESP_LOGI(TAG, "uart rx break");
                     break;
-                    //Event of UART parity check error
                 case UART_PARITY_ERR:
-                    invalid_buffer = true;
                     ESP_LOGI(TAG, "uart parity error");
                     break;
-                    //Event of UART frame error
                 case UART_FRAME_ERR:
-                    invalid_buffer = true;
                     ESP_LOGI(TAG, "uart frame error");
                     break;
-                    //UART_PATTERN_DET
                 case UART_PATTERN_DET:
-                    uart_get_buffered_data_len (EX_UART_NUM, &buffered_size);
-                    int pos = uart_pattern_pop_pos (EX_UART_NUM);
-  //                  ESP_LOGI(TAG, "[UART PATTERN DETECTED] pos: %d, buffered size: %d", pos, buffered_size);
-                    if (pos == -1) {
-                        // There used to be a UART_PATTERN_DET event, but the pattern position queue is full so that it can not
-                        // record the position. We should set a larger queue size.
-                        // As an example, we directly flush the rx buffer here.
-                        uart_flush_input (EX_UART_NUM);
-                    } else {
-                        if ((pos + data_size) > CMD_COMPRESSED_SIZE) {
-                            uart_read_bytes (EX_UART_NUM, dtmp, pos, portMAX_DELAY); //Skip data
-                            data_size += pos;
-                            invalid_buffer = true;
-                        } else {
-                            size_t read_size = uart_read_bytes (EX_UART_NUM, dtmp + data_size, pos, portMAX_DELAY);
-                            data_size += read_size;
-                        }
-                        uint8_t pat [PATTERN_CHR_NUM + 1];
-                        uart_read_bytes (EX_UART_NUM, pat, PATTERN_CHR_NUM, 100 / portTICK_PERIOD_MS);
-                    }
-                    if (invalid_buffer) {
-                        ESP_LOGI(TAG, "[INVALID_BUFFER] size: %u", data_size);
-                    } else {
-                        ESP_LOGI(TAG, "[COMMAND] size: %u", data_size);
-                    }
-                    data_size = 0;
-                    invalid_buffer = false;
+                    ESP_LOGE(TAG, "Unexpected UART_PATTERN_DET event");
                     break;
                     //Others
                 default:
@@ -140,23 +82,67 @@ void app_main () {
 
     /* Configure parameters of an UART driver,
      * communication pins and install the driver */
-    uart_config_t uart_config =
-        { .baud_rate = 2000000, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1, .flow_ctrl =
-                UART_HW_FLOWCTRL_DISABLE };
-    uart_param_config (EX_UART_NUM, &uart_config);
+//    uart_config_t uart_config =
+//        { .baud_rate = 460800, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1, .flow_ctrl =
+//                UART_HW_FLOWCTRL_DISABLE };
+//    uart_param_config (EX_UART_NUM, &uart_config);
 
     //Set UART log level
     esp_log_level_set (TAG, ESP_LOG_INFO);
     //Set UART pins (using UART0 default pins ie no changes.)
-    uart_set_pin (EX_UART_NUM, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+//    uart_set_pin (EX_UART_NUM, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     //Install UART driver, and get the queue.
     uart_driver_install (EX_UART_NUM, BUF_SIZE * 2, BUF_SIZE * 2, 20, &uart0_queue, 0);
 
-    //Set uart pattern detect function.
-    uart_enable_pattern_det_intr (EX_UART_NUM, '+', PATTERN_CHR_NUM, 10000, 10, 10);
-    //Reset the pattern queue length to record at most 20 pattern positions.
-    uart_pattern_queue_reset (EX_UART_NUM, 20);
+    /* SPI Part */
+    esp_err_t ret;
+    spi_bus_config_t buscfg={
+        .miso_io_num=PIN_NUM_MISO,
+        .mosi_io_num=PIN_NUM_MOSI,
+        .sclk_io_num=PIN_NUM_CLK,
+        .quadwp_io_num=-1,
+        .quadhd_io_num=-1,
+        .max_transfer_sz=100,
+        .flags=SPICOMMON_BUSFLAG_MASTER
+    };
+
+    spi_device_interface_config_t devcfg={
+        .clock_speed_hz=1*1000*1000,           //Clock out at 10 MHz
+        .mode=0,                                //SPI mode 0
+        .spics_io_num=PIN_NUM_CS,               //CS pin
+        .queue_size=7,                          //We want to be able to queue 7 transactions at a time
+        .pre_cb = NULL,  //Specify pre-transfer callback to handle D/C line
+    };
+
+    //Initialize the SPI bus
+    ret = spi_bus_initialize(CANFD_SPI, &buscfg, 0);
+    ESP_ERROR_CHECK(ret);
+
+    //Attach the LCD to the SPI bus
+    ret=spi_bus_add_device(CANFD_SPI, &devcfg, &canfd_spi);
+    ESP_ERROR_CHECK(ret);
+
+    int8_t result;
+
+    result=DRV_CANFDSPI_OperationModeSelect(0,CAN_CONFIGURATION_MODE);
+    ESP_LOGI(TAG, "DRV_CANFDSPI_OperationModeSelect return %u", result);
+    CAN_OPERATION_MODE mode=DRV_CANFDSPI_OperationModeGet(0);
+    ESP_LOGI(TAG, "DRV_CANFDSPI_OperationModeGet return %u", mode);
+
+    CAN_OSC_STATUS status;
+    result=DRV_CANFDSPI_OscillatorStatusGet(0U, &status);
+    ESP_LOGI(TAG, "DRV_CANFDSPI_OscillatorStatusGet return %u", result);
+    ESP_LOGI(TAG, "PllReady=%u",status.PllReady);
+    ESP_LOGI(TAG, "OscReady=%u",status.OscReady);
+    ESP_LOGI(TAG, "SclkReady=%u",status.SclkReady);
+
+    CAN_BUS_DIAGNOSTIC bd;
+    result = DRV_CANFDSPI_BusDiagnosticsGet(0U, &bd);
+    ESP_LOGI(TAG, "DRV_CANFDSPI_BusDiagnosticsGet return %u", result);
+    ESP_LOGI(TAG, "errorFreeMsgCount = %u", bd.bF.errorFreeMsgCount);
+
 
     //Create a task to handler UART event from ISR
     xTaskCreate (uart_event_task, "uart_event_task", 2048, NULL, 12, NULL);
+
 }
